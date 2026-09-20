@@ -1,0 +1,123 @@
+diff --git a/common/common.cpp b/common/common.cpp
+index d8319cd..2cf7c26 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1889,19 +1889,19 @@ std::vector<llama_token> common_tokenize(
+     return result;
+ }
+ 
+-std::string common_token_to_piece(const struct llama_context * ctx, llama_token token, bool special) {
++std::string common_token_to_piece(const struct llama_context * ctx, llama_token token, bool special, int32_t lstrip) {
+     const llama_model * model = llama_get_model(ctx);
+     const llama_vocab * vocab = llama_model_get_vocab(model);
+-    return common_token_to_piece(vocab, token, special);
++    return common_token_to_piece(vocab, token, special, lstrip);
+ }
+ 
+-std::string common_token_to_piece(const struct llama_vocab * vocab, llama_token token, bool special) {
++std::string common_token_to_piece(const struct llama_vocab * vocab, llama_token token, bool special, int32_t lstrip) {
+     std::string piece;
+     piece.resize(piece.capacity());  // using string internal cache, 15 bytes + '\n'
+-    const int n_chars = llama_token_to_piece(vocab, token, &piece[0], piece.size(), 0, special);
++    const int n_chars = llama_token_to_piece(vocab, token, &piece[0], piece.size(), lstrip, special);
+     if (n_chars < 0) {
+         piece.resize(-n_chars);
+-        int check = llama_token_to_piece(vocab, token, &piece[0], piece.size(), 0, special);
++        int check = llama_token_to_piece(vocab, token, &piece[0], piece.size(), lstrip, special);
+         GGML_ASSERT(check == -n_chars);
+     }
+     else {
+diff --git a/common/common.h b/common/common.h
+index 63d0bad..b0bd159 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -1062,12 +1062,14 @@ std::vector<llama_token> common_tokenize(
+ std::string common_token_to_piece(
+         const struct llama_context * ctx,
+                        llama_token   token,
+-                       bool          special = true);
++                       bool          special = true,
++                    int32_t          lstrip  = 0);
+ 
+ std::string common_token_to_piece(
+           const struct llama_vocab * vocab,
+                        llama_token   token,
+-                       bool          special = true);
++                       bool          special = true,
++                    int32_t          lstrip  = 0);
+ 
+ // detokenizes a vector of tokens into a string
+ // should work similar to Python's `tokenizer.decode`
+diff --git a/src/llama-vocab.cpp b/src/llama-vocab.cpp
+index ee65faf..9502bdf 100644
+--- a/src/llama-vocab.cpp
++++ b/src/llama-vocab.cpp
+@@ -3751,8 +3751,11 @@ int32_t llama_vocab::impl::detokenize(
+ 
+     for (int32_t i = 0; i < n_tokens; ++i) {
+         GGML_ASSERT(avail >= 0);
+-        int32_t n_chars = token_to_piece(tokens[i], text, avail, remove_space, unparse_special);
+-        remove_space = false;
++        const llama_token token = tokens[i];
++        int32_t n_chars = token_to_piece(token, text, avail, remove_space, unparse_special);
++
++        const llama_token_attr attr = token_get_attr(token);
++        remove_space = add_space_prefix && (attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED));
+         if (n_chars < 0) {
+             avail = 0;
+             total -= n_chars;
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index b6835e4..832465a 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -286,6 +286,7 @@ struct server_slot {
+     bool has_next_token = true;
+     bool has_new_line   = false;
+     bool truncated      = false;
++    bool lstrip_next_token = false;
+ 
+     stop_type stop;
+ 
+@@ -375,6 +376,7 @@ struct server_slot {
+         generated_text = "";
+         has_new_line   = false;
+         truncated      = false;
++        lstrip_next_token = false;
+         stop           = STOP_TYPE_NONE;
+         stopping_word  = "";
+         n_sent_text    = 0;
+@@ -3802,6 +3804,16 @@ private:
+                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
+         };
+ 
++        auto token_to_piece = [&](server_slot & slot, llama_token token) {
++            const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(slot.ctx_tgt));
++            const int32_t lstrip = slot.lstrip_next_token ? 1 : 0;
++            const bool special = accept_special_token(slot, token);
++            const std::string piece = common_token_to_piece(vocab, token, special, lstrip);
++            const llama_token_attr attr = llama_vocab_get_attr(vocab, token);
++            slot.lstrip_next_token = static_cast<bool>(attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED));
++            return piece;
++        };
++
+         iterate(slots, [&](server_slot & slot) {
+             // optionally send prompt processing progress
+             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
+@@ -3875,7 +3887,7 @@ private:
+ 
+             completion_token_output result;
+             result.tok          = id;
+-            result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
++            result.text_to_send = token_to_piece(slot, result.tok);
+             result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
+ 
+             if (slot.task->params.sampling.n_probs > 0) {
+@@ -4001,7 +4013,7 @@ private:
+                 completion_token_output result;
+ 
+                 result.tok          = ids[i];
+-                result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
++                result.text_to_send = token_to_piece(slot, result.tok);
+                 result.prob         = 1.0f; // set later
+ 
+                 // TODO: set result.probs
